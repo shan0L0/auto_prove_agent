@@ -1,0 +1,602 @@
+from __future__ import annotations
+
+import json
+import os
+import re
+import subprocess
+from dataclasses import asdict
+from math import ceil
+from pathlib import Path
+from typing import Iterable, List, Optional
+
+from .lean_runner import LeanRunner
+from .logging_utils import RunLogger
+from .models import ProofState, RetrievalResult
+from .ui import ConsoleReporter, truncate
+
+
+class MathlibSearcher:
+    """Search local Mathlib source files and return human-readable snippets."""
+
+    def __init__(self, roots: Optional[Iterable[Path]] = None) -> None:
+        self.roots = [Path(root) for root in roots] if roots else _default_mathlib_roots()
+
+    def search_many(self, queries: Iterable[str], limit: int = 8) -> List[RetrievalResult]:
+        # Give every query a chance to contribute before ranking. A very broad
+        # first query such as `Fin.val` can produce hundreds of hits; if it fills
+        # the whole candidate pool, later precise queries like `Nat.mod_lt` never
+        # reach the prompt.
+        query_list = _dedupe(query.strip() for query in queries if query.strip())
+        if not query_list or limit <= 0:
+            return []
+        candidates: List[RetrievalResult] = []
+        by_query: dict[str, List[RetrievalResult]] = {query: [] for query in query_list}
+        seen: set[tuple[str, int, str]] = set()
+        fetch_limit = limit * 3
+        per_query_limit = max(1, ceil(fetch_limit / len(query_list)))
+        for query in query_list:
+            for result in self.search(query, limit=per_query_limit):
+                key = (result.file_path or "", result.line or 0, result.name)
+                if key in seen:
+                    continue
+                seen.add(key)
+                candidates.append(result)
+                by_query[query].append(result)
+
+        # If the first balanced pass found too little, fill the remaining pool
+        # with another pass over all queries. This keeps recall without letting
+        # the earliest generic query monopolize the results.
+        if len(candidates) < fetch_limit:
+            for query in query_list:
+                for result in self.search(query, limit=fetch_limit):
+                    key = (result.file_path or "", result.line or 0, result.name)
+                    if key in seen:
+                        continue
+                    seen.add(key)
+                    candidates.append(result)
+                    by_query[query].append(result)
+                    if len(candidates) >= fetch_limit:
+                        break
+                if len(candidates) >= fetch_limit:
+                    break
+        selected: List[RetrievalResult] = []
+        selected_keys: set[tuple[str, int, str]] = set()
+        for query in query_list:
+            if len(selected) >= limit:
+                break
+            query_hits = sorted(by_query[query], key=lambda r: r.score, reverse=True)
+            if not query_hits:
+                continue
+            best = query_hits[0]
+            key = (best.file_path or "", best.line or 0, best.name)
+            if key not in selected_keys:
+                selected_keys.add(key)
+                selected.append(best)
+
+        for result in sorted(candidates, key=lambda r: r.score, reverse=True):
+            if len(selected) >= limit:
+                break
+            key = (result.file_path or "", result.line or 0, result.name)
+            if key in selected_keys:
+                continue
+            selected_keys.add(key)
+            selected.append(result)
+        return selected
+
+    def search(self, query: str, limit: int = 5) -> List[RetrievalResult]:
+        query = query.strip()
+        if not query:
+            return []
+        matches: List[RetrievalResult] = []
+        for root in self.roots:
+            if not root.is_dir():
+                continue
+            try:
+                completed = subprocess.run(
+                    [
+                        "rg",
+                        "--line-number",
+                        "--ignore-case",
+                        "--fixed-strings",
+                        "--glob",
+                        "*.lean",
+                        query,
+                        str(root),
+                    ],
+                    text=True,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    check=False,
+                )
+            except FileNotFoundError:
+                return []
+            if completed.returncode not in {0, 1}:
+                continue
+            for line in completed.stdout.splitlines():
+                parsed = _parse_rg_line(line)
+                if not parsed:
+                    continue
+                path, line_number, match_text = parsed
+                snippet = _read_snippet(path, line_number)
+                matches.append(
+                    RetrievalResult(
+                        source="mathlib",
+                        query=query,
+                        name=_guess_decl_name(snippet) or match_text.strip()[:80],
+                        file_path=str(path),
+                        line=line_number,
+                        snippet=snippet,
+                        score=_score_match(query, path, snippet),
+                    )
+                )
+                if len(matches) >= limit:
+                    return matches
+        return matches
+
+
+class LeanStateSearcher:
+    """Run LeanSearchClient's `#statesearch` tactic on the current theorem goal."""
+
+    def __init__(self, runner: LeanRunner, revision: Optional[str] = None, query_count: int = 6) -> None:
+        self.runner = runner
+        self.revision = revision or _lean_revision()
+        self.query_count = query_count
+
+    def search(self, header: str, theorem: str) -> List[RetrievalResult]:
+        code = _state_search_code(header, theorem, self.revision, self.query_count)
+        result = self.runner.check(code, file_name="StateSearch.lean", allow_sorry=True)
+        if not result.output.strip():
+            return []
+        if result.timed_out or result.returncode != 0:
+            return [
+                RetrievalResult(
+                    source="lean_state_search",
+                    query="current Lean goal",
+                    diagnostic=truncate(result.output, 2000),
+                    score=0.0,
+                )
+            ]
+        return parse_state_search_output(result.output)
+
+
+def retrieve_knowledge(
+    state: ProofState,
+    runner: LeanRunner,
+    workspace_dir: Optional[Path] = None,
+    mathlib_limit: int = 8,
+    enable_state_search: bool = False,
+    state_search_limit: int = 6,
+    state_search_revision: Optional[str] = None,
+    reporter: Optional[ConsoleReporter] = None,
+    logger: Optional[RunLogger] = None,
+) -> ProofState:
+    reporter = reporter or ConsoleReporter(enabled=False)
+    queries = retrieval_queries_for_state(state)
+    if state.extra_retrieval_queries:
+        queries = _dedupe([*state.extra_retrieval_queries, *queries])
+    reporter.step("Searching local Mathlib source")
+    reporter.info(f"Queries: {', '.join(queries[:8]) or 'none'}")
+    mathlib_results = MathlibSearcher().search_many(queries, limit=mathlib_limit)
+    reporter.info(f"Mathlib results: {len(mathlib_results)}")
+    for result in mathlib_results[:5]:
+        location = f"{result.file_path}:{result.line}" if result.file_path and result.line else result.name
+        reporter.detail(f"- {location}\n{result.snippet}")
+
+    state_search_results: List[RetrievalResult] = []
+    if enable_state_search:
+        reporter.step("Running Lean State Search")
+        state_search_results = LeanStateSearcher(
+            runner,
+            revision=state_search_revision,
+            query_count=state_search_limit,
+        ).search(state.header, state.theorem)
+        reporter.info(f"Lean State Search results: {len(state_search_results)}")
+        for result in state_search_results[:5]:
+            if result.diagnostic:
+                reporter.detail(result.diagnostic)
+            else:
+                reporter.detail(f"- {result.name}\n{result.content}")
+    else:
+        reporter.info("Lean State Search disabled; pass --enable-state-search to query the external service")
+
+    all_results = [*mathlib_results, *_enrich_state_results(state_search_results)]
+    state.retrieved_context = all_results
+    if workspace_dir:
+        write_retrieval_report(all_results, workspace_dir)
+        reporter.path("Retrieval report", workspace_dir / "retrieval_results.md")
+    if logger:
+        logger.event("knowledge_retrieved", {"queries": queries, "results": [asdict(result) for result in all_results]})
+    return state
+
+
+def retrieval_queries_for_state(state: ProofState) -> List[str]:
+    """Build retrieval queries dynamically from the theorem text and goals.
+
+    Strategy (applied in order, results deduplicated):
+    1. Extract qualified Lean names present in the theorem (e.g. ``Finset.sum``,
+       ``Module.finrank``, ``Nat.Prime``).
+    2. Map mathematical symbols / keywords found in the text to relevant Mathlib
+       library areas (e.g. ``∑`` → Finset.sum, ``%`` → Nat.mod_lt).
+    3. Fall back to analysis domain hints when nothing else matches.
+    """
+    # Use the theorem text verbatim, but strip Lean diagnostic lines from goals
+    # (lines like "/path/to/TraceState.lean:5:8: warning: ...") before feeding
+    # them into the query extractor — otherwise the file name gets mistaken for
+    # a qualified Lean identifier and wastes retrieval slots on garbage results.
+    _DIAG_LINE = re.compile(r'^\s*\S+\.lean:\d+:\d+:\s*(warning|error|info):', re.IGNORECASE)
+    clean_goals = [
+        "\n".join(line for line in goal.splitlines() if not _DIAG_LINE.match(line))
+        for goal in state.goals
+    ]
+    text = "\n".join([state.theorem, *clean_goals])
+    queries: List[str] = []
+
+    # --- 1. Qualified Lean names present in the theorem text ----------------
+    # Match patterns like  Finset.sum  Nat.Prime  Module.finrank  Real.rpow
+    # Skip anything ending in `.lean` — those are file names, not Lean identifiers.
+    for m in re.finditer(r'\b([A-Z][a-zA-Z0-9]*(?:\.[A-Za-z][a-zA-Z0-9]*)+)\b', text):
+        name = m.group(1)
+        if name.endswith(".lean"):
+            continue
+        queries.append(name)
+        # Also add the top-level namespace for broader search
+        queries.append(name.split(".")[0])
+
+    # --- 2. Symbol / keyword → library-area mapping -------------------------
+    _SYMBOL_MAP: List[tuple[str, List[str]]] = [
+        # Fin / modular index arithmetic
+        (r'\bFin\b',
+         ["Fin.val", "Finset.univ_fin", "Fin.sum_univ", "Nat.mod_lt"]),
+        # Finset summation (∑ or Finset.sum spelled out)
+        (r'∑|Finset\.sum',
+         ["Finset.sum_congr", "Finset.sum_add_distrib",
+          "Finset.sum_mul", "Finset.mul_sum", "Finset.sum_comm"]),
+        # Modular arithmetic / remainder
+        (r'%\s*\w|\bmod\b',
+         ["Nat.mod_lt", "Nat.mod_add_div", "Nat.mod_def",
+          "Nat.add_mod", "Nat.mod_mod_of_dvd"]),
+        # Linear algebra / subspaces
+        (r'\bSubmodule\b|\bfinrank\b|\bFiniteDimensional\b',
+         ["Module.finrank", "Submodule.finrank_add_finrank_orthogonal",
+          "FiniteDimensional"]),
+        # Real analysis / powers / logs
+        (r'\bReal\.rpow\b|\brpow\b|\bReal\.log\b',
+         ["Real.rpow", "Real.rpow_natCast", "Real.log_pow"]),
+        # Number theory
+        (r'\bNat\.Prime\b|\bprime\b',
+         ["Nat.Prime", "Nat.Prime.dvd_mul", "Nat.Prime.eq_one_or_self_of_dvd"]),
+        # Modular congruences
+        (r'\bInt\.ModEq\b|\bModEq\b',
+         ["Int.ModEq", "Nat.ModEq", "Int.emod_emod_of_dvd"]),
+        # Group / Fintype cardinality
+        (r'\bAddCommGroup\b|\bFintype\.card\b|\bFintype\b',
+         ["Fintype.card", "AddCommGroup", "Finset.card_univ"]),
+        # Probability-like: sum-to-one, non-negative reals, π-like names
+        (r'π\s*[a-z]|hπ_|hπ |∑.*=.*1\b|= 1\b.*∑',
+         ["Finset.sum_eq_one", "Finset.sum_nonneg",
+          "Finset.sum_mul_distrib", "mul_comm"]),
+        # Nat / Int arithmetic
+        (r'\bNat\b|\bℕ\b',
+         ["Nat.add_comm", "Nat.lt_of_lt_pred", "Nat.le_of_lt_succ"]),
+        (r'\bInt\b|\bℤ\b',
+         ["Int.add_mul_emod_self", "Int.coe_nat_dvd"]),
+    ]
+
+    for pattern, names in _SYMBOL_MAP:
+        if re.search(pattern, text):
+            queries.extend(names)
+
+    # --- 3. Fall back to analysis domain hints when nothing was collected ----
+    if not queries and state.analysis:
+        queries.extend(state.analysis.domain_hints)
+
+    return _dedupe(queries)[:16]
+
+
+def parse_state_search_output(output: str) -> List[RetrievalResult]:
+    results: List[RetrievalResult] = []
+    for raw in output.splitlines():
+        line = raw.strip()
+        if not line.startswith("• #check "):
+            continue
+        match = re.match(r"• #check\s+([^\s]+)\s*(?:--\s*(.*))?$", line)
+        if not match:
+            continue
+        name = match.group(1)
+        type_text = match.group(2) or ""
+        results.append(
+            RetrievalResult(
+                source="lean_state_search",
+                query="current Lean goal",
+                name=name,
+                content=f"#check {name}" + (f" -- {type_text}" if type_text else ""),
+                score=max(0.0, 1.0 - len(results) * 0.05),
+            )
+        )
+    if results:
+        return results
+    cleaned = output.strip()
+    if cleaned:
+        return [
+            RetrievalResult(
+                source="lean_state_search",
+                query="current Lean goal",
+                diagnostic=truncate(cleaned, 2000),
+            )
+        ]
+    return []
+
+
+def write_retrieval_report(results: List[RetrievalResult], directory: Path) -> None:
+    directory.mkdir(parents=True, exist_ok=True)
+    (directory / "retrieval_results.json").write_text(
+        json.dumps([asdict(result) for result in results], indent=2, ensure_ascii=False),
+        encoding="utf-8",
+    )
+    (directory / "retrieval_results.md").write_text(_markdown_report(results), encoding="utf-8")
+
+
+def _enrich_state_results(results: List[RetrievalResult]) -> List[RetrievalResult]:
+    searcher = MathlibSearcher()
+    enriched: List[RetrievalResult] = []
+    for result in results:
+        if result.name:
+            source_hits = (
+                searcher.search(f"theorem {result.name}", limit=1)
+                or searcher.search(f"lemma {result.name}", limit=1)
+                or searcher.search(f"def {result.name}", limit=1)
+                or searcher.search(result.name, limit=1)
+            )
+            if source_hits:
+                hit = source_hits[0]
+                enriched.append(
+                    RetrievalResult(
+                        source=result.source,
+                        query=result.query,
+                        name=result.name,
+                        file_path=hit.file_path,
+                        line=hit.line,
+                        snippet=hit.snippet,
+                        content=result.content,
+                        score=result.score,
+                    )
+                )
+                continue
+        enriched.append(result)
+    return enriched
+
+
+def _state_search_code(header: str, theorem: str, revision: str, query_count: int) -> str:
+    imports = _merge_imports(header, "import LeanSearchClient")
+    theorem_with_search = _insert_state_search(theorem)
+    return (
+        imports
+        + "\n"
+        + f"set_option statesearch.queries {query_count}\n"
+        + f"set_option statesearch.revision \"{revision}\"\n\n"
+        + theorem_with_search
+        + "\n"
+    )
+
+
+def _insert_state_search(theorem: str) -> str:
+    if ":= by" in theorem:
+        prefix = theorem.split(":= by", 1)[0].rstrip()
+        return prefix + " := by\n  #statesearch\n  sorry"
+    return theorem.rstrip() + " := by\n  #statesearch\n  sorry"
+
+
+def _merge_imports(header: str, extra_import: str) -> str:
+    imports = []
+    rest = []
+    for line in header.splitlines():
+        stripped = line.strip()
+        if not stripped:
+            continue
+        if stripped.startswith("import "):
+            imports.append(stripped)
+        else:
+            rest.append(line)
+    if extra_import not in imports:
+        imports.append(extra_import)
+    return "\n".join([*imports, *rest]) + "\n"
+
+
+def _default_mathlib_roots() -> List[Path]:
+    root = Path(__file__).resolve().parent.parent
+    return [
+        root / ".lake" / "packages" / "mathlib" / "Mathlib",
+        root / "lean_workspace" / ".lake" / "packages" / "mathlib" / "Mathlib",
+    ]
+
+
+def _lean_revision() -> str:
+    configured = os.getenv("AUTO_PROVE_STATE_SEARCH_REVISION")
+    if configured:
+        return configured
+    root = Path(__file__).resolve().parent.parent
+    for toolchain in [root / "lean-toolchain", root / "lean_workspace" / "lean-toolchain"]:
+        if toolchain.exists():
+            text = toolchain.read_text(encoding="utf-8").strip()
+            match = re.search(r"v[0-9][^\s]*", text)
+            if match:
+                return match.group(0)
+    return os.getenv("AUTO_PROVE_STATE_SEARCH_REVISION", "v4.30.0-rc2")
+
+
+def _parse_rg_line(line: str) -> Optional[tuple[Path, int, str]]:
+    parts = line.split(":", 2)
+    if len(parts) != 3:
+        return None
+    try:
+        return Path(parts[0]), int(parts[1]), parts[2]
+    except ValueError:
+        return None
+
+
+def _read_snippet(path: Path, line_number: int, radius: int = 8) -> str:
+    try:
+        lines = path.read_text(encoding="utf-8").splitlines()
+    except UnicodeDecodeError:
+        lines = path.read_text(errors="replace").splitlines()
+    start = max(1, line_number - radius)
+    end = min(len(lines), line_number + radius)
+    return "\n".join(f"{index:>5}: {lines[index - 1]}" for index in range(start, end + 1))
+
+
+def _guess_decl_name(snippet: str) -> str:
+    pattern = r"\b(?:theorem|lemma|def|abbrev|instance|class|structure|inductive)\s+([A-Za-z0-9_'.]+)"
+    match = re.search(pattern, snippet)
+    return match.group(1) if match else ""
+
+
+def _score_match(query: str, path: Path, snippet: str) -> float:
+    path_str = str(path)
+    # Lean metaprogramming / compiler-infrastructure files live under Mathlib/Lean/
+    # and are not mathematical lemmas.  Heavily penalise them so they are only
+    # returned when nothing better is found.
+    if "/Mathlib/Lean/" in path_str or "\\Mathlib\\Lean\\" in path_str:
+        return 0.05
+    score = 0.4
+    if query in snippet:
+        score += 0.3
+    if any(part in path_str for part in ["NumberTheory", "Data", "Algebra", "Tactic",
+                                          "Analysis", "Topology", "Probability"]):
+        score += 0.1
+    if re.search(r"\b(theorem|lemma)\b", snippet):
+        score += 0.2
+    return min(score, 1.0)
+
+
+def extract_unknown_identifiers(error_text: str) -> List[str]:
+    """Extract unknown constant / identifier names from Lean error output."""
+    names: List[str] = []
+    for m in re.finditer(r"Unknown constant[`' ]+([A-Za-z0-9_.]+)", error_text):
+        names.append(m.group(1))
+    for m in re.finditer(r"unknown identifier '([A-Za-z0-9_.]+)'", error_text):
+        names.append(m.group(1))
+    return _dedupe(names)
+
+
+def _fuzzy_queries_for_identifier(name: str) -> List[str]:
+    """Generate fuzzy search terms from an unknown Lean identifier."""
+    parts = name.split(".")
+    queries: List[str] = [name]
+    if len(parts) > 1:
+        queries.append(parts[-1])               # e.g. kroneckerProduct
+        queries.append(f"{parts[0]}.{parts[-1]}")  # e.g. Matrix.kroneckerProduct
+        if len(parts) > 2:
+            queries.append(".".join(parts[-2:]))
+    # Split CamelCase of the last component for broader coverage
+    last = parts[-1]
+    camel_words = re.sub(r"([A-Z][a-z]+|[A-Z]+(?=[A-Z]|$))", r" \1", last).split()
+    queries.extend(w for w in camel_words if len(w) > 3)
+    return _dedupe(q for q in queries if len(q) > 2)
+
+
+def _grep_mathlib(pattern: str, roots: List[Path], limit: int = 10) -> List[tuple[Path, int, str]]:
+    """Search Mathlib .lean files using grep (works without rg binary)."""
+    results: List[tuple[Path, int, str]] = []
+    for root in roots:
+        if not root.is_dir():
+            continue
+        try:
+            completed = subprocess.run(
+                ["grep", "-r", "--include=*.lean", "-n", "-i", "--fixed-strings", pattern, str(root)],
+                text=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.DEVNULL,
+                check=False,
+            )
+        except FileNotFoundError:
+            continue
+        for line in completed.stdout.splitlines():
+            parts = line.split(":", 2)
+            if len(parts) < 3:
+                continue
+            try:
+                path, lineno, content = Path(parts[0]), int(parts[1]), parts[2]
+                results.append((path, lineno, content))
+                if len(results) >= limit:
+                    return results
+            except (ValueError, IndexError):
+                continue
+    return results
+
+
+def suggest_mathlib_alternatives(names: List[str], limit_per_name: int = 3) -> str:
+    """Fuzzy-search local Mathlib for alternatives to unknown identifiers.
+
+    Returns a formatted string for appending to a diagnostic message,
+    or an empty string if nothing was found.
+    """
+    if not names:
+        return ""
+    roots = _default_mathlib_roots()
+    lines: List[str] = []
+    for name in names[:5]:
+        queries = _fuzzy_queries_for_identifier(name)
+        found: dict[str, tuple[Path, int]] = {}  # decl_name → (path, line)
+        for q in queries:
+            hits = _grep_mathlib(q, roots, limit=20)
+            for path, lineno, content in hits:
+                decl_match = re.search(
+                    r"\b(?:theorem|lemma|def|abbrev|noncomputable def)\s+([A-Za-z0-9_.]+)", content
+                )
+                if decl_match:
+                    decl = decl_match.group(1)
+                    if decl not in found:
+                        found[decl] = (path, lineno)
+                if len(found) >= limit_per_name:
+                    break
+            if len(found) >= limit_per_name:
+                break
+        if found:
+            hits_str = ", ".join(
+                f"`{decl}` ({path.name}:{lineno})"
+                for decl, (path, lineno) in list(found.items())[:limit_per_name]
+            )
+            lines.append(f"Mathlib fuzzy matches for `{name}`: {hits_str}")
+        else:
+            lines.append(
+                f"No local Mathlib matches found for `{name}` — verify the API name in Mathlib docs."
+            )
+    return "\n".join(lines)
+
+
+def _dedupe(items: Iterable[str]) -> List[str]:
+    result = []
+    seen = set()
+    for item in items:
+        if item in seen:
+            continue
+        seen.add(item)
+        result.append(item)
+    return result
+
+
+def _markdown_report(results: List[RetrievalResult]) -> str:
+    lines = ["# Retrieval Results", ""]
+    if not results:
+        lines.append("No retrieval results.")
+        return "\n".join(lines) + "\n"
+    for index, result in enumerate(results, start=1):
+        lines.extend(
+            [
+                f"## {index}. {result.source}: {result.name or result.query}",
+                "",
+                f"- Query: `{result.query}`",
+                f"- Score: `{result.score:.2f}`",
+            ]
+        )
+        if result.file_path:
+            location = f"{result.file_path}:{result.line}" if result.line else result.file_path
+            lines.append(f"- Location: `{location}`")
+        if result.content:
+            lines.extend(["", "```lean", result.content.strip(), "```"])
+        if result.snippet:
+            lines.extend(["", "```lean", result.snippet.rstrip(), "```"])
+        if result.diagnostic:
+            lines.extend(["", "```text", result.diagnostic.strip(), "```"])
+        lines.append("")
+    return "\n".join(lines).rstrip() + "\n"

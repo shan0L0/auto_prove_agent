@@ -1,0 +1,2 @@
+"""Lean proof agent MVP."""
+

@@ -1,0 +1,24 @@
+[project]
+name = "auto-prove"
+version = "0.1.0"
+description = "Lean 4 interactive proof agent MVP"
+requires-python = ">=3.10"
+dependencies = [
+  "langchain==1.2.15",
+  "langchain-openai==1.2.1",
+  "langchain-anthropic==1.4.1",
+  "langsmith>=0.8.0,<0.9",
+  "pyarrow>=24.0.0",
+  "rich"
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=7", "pytest-cov"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["."]
+addopts = "-m 'not integration'"
+markers = [
+  "integration: tests that require real Lean, Lean LSP, network LLM, or other external services",
+]

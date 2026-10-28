@@ -1,0 +1,45 @@
+# Secrets and local environment
+.env
+!.env.example
+.venv/
+venv/
+env/
+
+# Python caches, tooling, and reports
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+coverage.xml
+htmlcov/
+
+# Lean/Lake build products
+.lake/
+lean_workspace/.lake/
+*.olean
+*.ilean
+*.c
+*.o
+
+# Agent run artifacts and generated outputs
+runs/
+output/
+
+# Raw dataset files (large, downloaded separately)
+*.parquet
+
+# Ephemeral Lean workspaces created per-run by the agent
+lean_workspace/auto_prove_*/
+
+# OS/editor noise
+.DS_Store
+*.swp
+*.swo
+
+# Keep VSCode project launch/settings files tracked for this repo.
+!.vscode/
+!.vscode/settings.json
+!.vscode/launch.json

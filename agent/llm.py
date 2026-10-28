@@ -1,0 +1,603 @@
+from __future__ import annotations
+
+import json
+import os
+import re
+from abc import ABC, abstractmethod
+from typing import Any, List, Optional
+
+from pydantic import BaseModel
+
+from .llm_prompts import (
+    PROMPT_DIR,
+    messages_for_state as _messages_for_state,
+    parent_witness_validation_messages as _parent_witness_validation_messages,
+    proof_design_messages_for_state as _proof_design_messages_for_state,
+    repair_parent_assembly_messages as _repair_parent_assembly_messages,
+    retry_review_messages as _retry_review_messages,
+    review_proof_designs_messages as _review_proof_designs_messages,
+    sorry_driven_prompt as _sorry_driven_prompt,
+    sorry_split_messages_for_state as _sorry_split_messages_for_state,
+    triage_messages as _triage_messages,
+    witness_validation_messages as _witness_validation_messages,
+)
+from .langsmith_utils import langsmith_runnable_config
+from .llm_types import (
+    FalsifiedSublemma,
+    ParentWitnessFalsificationOut,
+    ProofCandidateOut,
+    ProofCandidatesOut,
+    ProofDesignReviewOut,
+    ProofDesignsOut,
+    RepairParentOut,
+    RetryConfigOut,
+    RetryProfileOut,
+    SorrySublemmaOut,
+    SorrySkeletonOut,
+    TriageOut,
+    WitnessValidationOut,
+)
+from .models import Candidate, ProofState
+from .token_tracker import TokenTracker, extract_usage_metadata
+
+
+class LLMClient(ABC):
+    @abstractmethod
+    def propose(self, state: ProofState, beam_width: int) -> List[Candidate]:
+        raise NotImplementedError
+
+    def design_proofs(self, state: ProofState, max_designs: int = 3) -> Optional[ProofDesignsOut]:
+        return None
+
+    def split_with_sorries(self, state: ProofState, max_subgoals: int = 5) -> Optional[SorrySkeletonOut]:
+        return None
+
+    def validate_skeleton_witness(
+        self,
+        parent_statement: str,
+        preamble: str,
+        setup_code: str,
+        sublemma_blocks: List[str],
+    ) -> Optional[WitnessValidationOut]:
+        return None
+
+    def validate_parent_witness(
+        self,
+        parent_statement: str,
+        preamble: str,
+        setup_code: str,
+    ) -> Optional[ParentWitnessFalsificationOut]:
+        return None
+
+    def triage_problem(self, theorem: str, retrieved_context: str = "") -> Optional[TriageOut]:
+        return None
+
+    def review_failure(self, failure_context: str) -> Optional[RetryProfileOut]:
+        return None
+
+    def repair_parent_assembly(
+        self,
+        theorem: str,
+        parent_proof_code: str,
+        child_names: List[str],
+        setup_code: str,
+        goals: str,
+    ) -> Optional[str]:
+        return None
+
+    def review_proof_designs(
+        self,
+        designs: "ProofDesignsOut",
+        state: "ProofState",
+    ) -> Optional[ProofDesignReviewOut]:
+        return None
+
+    def fork(self) -> Optional["LLMClient"]:
+        return None
+
+
+class HeuristicLLMClient(LLMClient):
+    """Deterministic candidate generator used until a real API client is wired."""
+
+    def __init__(self) -> None:
+        self.last_request_messages: List[dict[str, str]] = []
+        self.last_response_text = ""
+        self.last_candidate_count = 0
+        self.last_mode = "heuristic"
+        self.last_error = ""
+
+    def propose(self, state: ProofState, beam_width: int) -> List[Candidate]:
+        theorem = state.theorem.strip()
+        candidates = [
+            Candidate(code=_complete_with(theorem, "simp"), score=0.7, rationale="Try simplification."),
+            Candidate(code=_complete_with(theorem, "rfl"), score=0.6, rationale="Try reflexivity."),
+            Candidate(code=_complete_with(theorem, "omega"), score=0.5, rationale="Try arithmetic solver."),
+            Candidate(code=_complete_with(theorem, "aesop"), score=0.4, rationale="Try proof search."),
+        ]
+        selected = candidates[:beam_width]
+        self.last_request_messages = [{"role": "heuristic", "content": "Generated deterministic tactic candidates."}]
+        self.last_response_text = json.dumps({"candidates": [candidate.__dict__ for candidate in selected]}, ensure_ascii=False)
+        self.last_candidate_count = len(selected)
+        self.last_mode = "heuristic"
+        self.last_error = ""
+        return selected
+
+    def fork(self) -> "LLMClient":
+        return HeuristicLLMClient()
+
+
+class LangChainProofClient(LLMClient):
+    """Shared LangChain prompt and response parser for chat model providers."""
+
+    def __init__(
+        self,
+        chat_model: Any,
+        source: str,
+        token_tracker: Optional[TokenTracker] = None,
+    ) -> None:
+        self.chat_model = chat_model
+        self.source = source
+        self.last_response_text = ""
+        self.last_candidate_count = 0
+        self.last_mode = "none"
+        self.last_error = ""
+        self.last_request_messages: List[dict[str, str]] = []
+        self.last_input_tokens = 0
+        self.last_output_tokens = 0
+        # Forks share a tracker so concurrent workers contribute to one ledger.
+        self.token_tracker = token_tracker or TokenTracker()
+        self.model_name: str = getattr(chat_model, "model_name", None) or getattr(chat_model, "model", "") or ""
+        # Diagnostics extracted from sorry-containing rejected candidates.
+        # Populated by _propose_structured; consumed by the split design stage.
+        self.last_sorry_hints: List[str] = []
+
+    def propose(self, state: ProofState, beam_width: int) -> List[Candidate]:
+        candidates = self._propose_structured(state, beam_width)
+        if not candidates:
+            if not self.last_error:
+                self.last_error = "structured output returned no usable Lean candidates"
+            self.last_mode = "no_usable_lean"
+        self.last_candidate_count = len(candidates)
+        return candidates[:beam_width]
+
+    def design_proofs(self, state: ProofState, max_designs: int = 3) -> Optional[ProofDesignsOut]:
+        try:
+            messages = _proof_design_messages_for_state(state, max_designs)
+            self.last_request_messages = _messages_to_dicts(messages)
+            response = self._invoke_structured(ProofDesignsOut, messages, "proof design")
+            self.last_response_text = _model_dump_json_or_debug(response)
+            self.last_mode = "proof_design_structured"
+            self.last_error = ""
+            return response
+        except Exception as exc:
+            self.last_error = f"proof_design {type(exc).__name__}: {exc}"
+            self.last_mode = "proof_design_failed"
+            return None
+
+    def split_with_sorries(self, state: ProofState, max_subgoals: int = 5) -> Optional[SorrySkeletonOut]:
+        try:
+            messages = _sorry_split_messages_for_state(state, max_subgoals)
+            self.last_request_messages = _messages_to_dicts(messages)
+            response = self._invoke_structured(SorrySkeletonOut, messages, "sorry split")
+            self.last_response_text = _model_dump_json_or_debug(response)
+            self.last_mode = "sorry_split_structured"
+            self.last_error = ""
+            return response
+        except Exception as exc:
+            self.last_error = f"sorry_split {type(exc).__name__}: {exc}"
+            self.last_mode = "sorry_split_failed"
+            return None
+
+    def review_failure(self, failure_context: str) -> Optional[RetryProfileOut]:
+        try:
+            messages = _retry_review_messages(failure_context)
+            self.last_request_messages = _messages_to_dicts(messages)
+            response = self._invoke_structured(RetryProfileOut, messages, "failure review")
+            self.last_response_text = _model_dump_json_or_debug(response)
+            self.last_mode = "failure_review_structured"
+            self.last_error = ""
+            return response
+        except Exception as exc:
+            self.last_error = f"failure_review {type(exc).__name__}: {exc}"
+            self.last_mode = "failure_review_failed"
+            return None
+
+    def repair_parent_assembly(
+        self,
+        theorem: str,
+        parent_proof_code: str,
+        child_names: List[str],
+        setup_code: str,
+        goals: str,
+    ) -> Optional[str]:
+        try:
+            messages = _repair_parent_assembly_messages(
+                theorem=theorem,
+                parent_proof_code=parent_proof_code,
+                child_names=child_names,
+                setup_code=setup_code,
+                goals=goals,
+            )
+            self.last_request_messages = _messages_to_dicts(messages)
+            response = self._invoke_structured(RepairParentOut, messages, "repair parent assembly")
+            self.last_response_text = _model_dump_json_or_debug(response)
+            self.last_mode = "repair_parent_structured"
+            self.last_error = ""
+            return response.parent_proof_code if response else None
+        except Exception as exc:
+            self.last_error = f"repair_parent {type(exc).__name__}: {exc}"
+            self.last_mode = "repair_parent_failed"
+            return None
+
+    def review_proof_designs(
+        self,
+        designs: ProofDesignsOut,
+        state: ProofState,
+    ) -> Optional[ProofDesignReviewOut]:
+        try:
+            goals = "\n\n".join(state.goals) if state.goals else "(not available yet)"
+            diagnostics = "\n\n".join(state.diagnostics[-5:]) if state.diagnostics else "(none)"
+            from .llm_prompts import retrieved_context_text, task_specific_guidance_text
+            messages = _review_proof_designs_messages(
+                designs_json=designs.model_dump_json(indent=2),
+                theorem=state.theorem,
+                goals=goals,
+                retrieved_context=retrieved_context_text(state),
+                diagnostics=diagnostics,
+                task_guidance=task_specific_guidance_text(state),
+            )
+            self.last_request_messages = _messages_to_dicts(messages)
+            response = self._invoke_structured(ProofDesignReviewOut, messages, "design review")
+            self.last_response_text = _model_dump_json_or_debug(response)
+            self.last_mode = "design_review_structured"
+            self.last_error = ""
+            return response
+        except Exception as exc:
+            self.last_error = f"design_review {type(exc).__name__}: {exc}"
+            self.last_mode = "design_review_failed"
+            return None
+
+    def validate_skeleton_witness(
+        self,
+        parent_statement: str,
+        preamble: str,
+        setup_code: str,
+        sublemma_blocks: List[str],
+    ) -> Optional[WitnessValidationOut]:
+        try:
+            messages = _witness_validation_messages(parent_statement, preamble, setup_code, sublemma_blocks)
+            self.last_request_messages = _messages_to_dicts(messages)
+            response = self._invoke_structured(WitnessValidationOut, messages, "witness validation")
+            self.last_response_text = _model_dump_json_or_debug(response)
+            self.last_mode = "witness_validation_structured"
+            self.last_error = ""
+            return response
+        except Exception as exc:
+            self.last_error = f"witness_validation {type(exc).__name__}: {exc}"
+            self.last_mode = "witness_validation_failed"
+            return None
+
+    def validate_parent_witness(
+        self,
+        parent_statement: str,
+        preamble: str,
+        setup_code: str,
+    ) -> Optional[ParentWitnessFalsificationOut]:
+        try:
+            messages = _parent_witness_validation_messages(parent_statement, preamble, setup_code)
+            self.last_request_messages = _messages_to_dicts(messages)
+            response = self._invoke_structured(ParentWitnessFalsificationOut, messages, "parent witness validation")
+            self.last_response_text = _model_dump_json_or_debug(response)
+            self.last_mode = "parent_witness_validation_structured"
+            self.last_error = ""
+            return response
+        except Exception as exc:
+            self.last_error = f"parent_witness_validation {type(exc).__name__}: {exc}"
+            self.last_mode = "parent_witness_validation_failed"
+            return None
+
+    def triage_problem(self, theorem: str, retrieved_context: str = "") -> Optional[TriageOut]:
+        try:
+            messages = _triage_messages(theorem, retrieved_context)
+            self.last_request_messages = _messages_to_dicts(messages)
+            response = self._invoke_structured(TriageOut, messages, "feasibility triage")
+            self.last_response_text = _model_dump_json_or_debug(response)
+            self.last_mode = "triage_structured"
+            self.last_error = ""
+            return response
+        except Exception as exc:
+            self.last_error = f"triage {type(exc).__name__}: {exc}"
+            self.last_mode = "triage_failed"
+            return None
+
+    def _propose_structured(self, state: ProofState, beam_width: int) -> List[Candidate]:
+        self.last_sorry_hints = []  # reset before each call
+        try:
+            messages = _messages_for_state(state, beam_width)
+            self.last_request_messages = _messages_to_dicts(messages)
+            response = self._invoke_structured(ProofCandidatesOut, messages, "proof candidates")
+            self.last_response_text = _model_dump_json_or_debug(response)
+            self.last_mode = "structured"
+            self.last_error = ""
+            candidates, rejected, sorry_hints = _candidates_from_structured(
+                response, state.theorem, self.source
+            )
+            self.last_sorry_hints = sorry_hints
+            if rejected and not candidates:
+                self.last_error = f"all structured candidates were rejected: {'; '.join(rejected[:5])}"
+            elif rejected:
+                self.last_error = f"rejected {len(rejected)} structured candidate(s): {'; '.join(rejected[:3])}"
+            return candidates
+        except Exception as exc:
+            self.last_error = f"{type(exc).__name__}: {exc}"
+            self.last_mode = "structured_failed"
+            return []
+
+    def _invoke_structured(self, schema: type[BaseModel], messages: List[tuple[str, str]], purpose: str) -> BaseModel:
+        method = getattr(self, "structured_output_method", None)
+        kwargs = {"include_raw": True}
+        if method:
+            kwargs["method"] = method
+        structured = self.chat_model.with_structured_output(schema, **kwargs)
+        config = langsmith_runnable_config(
+            purpose=purpose,
+            source=self.source,
+            model=self.model_name,
+        )
+        try:
+            response = structured.invoke(messages, config=config)
+        except TypeError as exc:
+            if "config" not in str(exc):
+                raise
+            # Unit-test doubles and some lightweight adapters implement the
+            # older LangChain shape without a `config` keyword. Keep tracing for
+            # real clients while staying compatible with those small fakes.
+            response = structured.invoke(messages)
+        if isinstance(response, dict) and {"raw", "parsed", "parsing_error"}.issubset(response.keys()):
+            self._record_token_usage(response.get("raw"), purpose)
+            self.last_response_text = _structured_debug_text(response)
+            parsed = response.get("parsed")
+            if parsed is not None:
+                return parsed
+            parsing_error = response.get("parsing_error")
+            raw_summary = _raw_message_summary(response.get("raw"))
+            if parsing_error:
+                raise ValueError(f"structured {purpose} parsing failed: {parsing_error}; raw={raw_summary}")
+            raise ValueError(f"structured {purpose} returned None; raw={raw_summary}")
+        if response is None:
+            raise ValueError(f"structured {purpose} returned None")
+        return response
+
+    def _record_token_usage(self, raw_message: Any, phase: str) -> None:
+        usage = extract_usage_metadata(raw_message)
+        if not usage:
+            self.last_input_tokens = 0
+            self.last_output_tokens = 0
+            return
+        self.last_input_tokens = usage["input_tokens"]
+        self.last_output_tokens = usage["output_tokens"]
+        self.token_tracker.add(
+            phase=phase,
+            input_tokens=usage["input_tokens"],
+            output_tokens=usage["output_tokens"],
+            model=self.model_name,
+        )
+
+
+class OpenAICompatibleClient(LangChainProofClient):
+    """LangChain adapter for OpenAI-compatible chat completion endpoints."""
+
+    def __init__(
+        self,
+        model: str = "gpt-4.1-mini",
+        token_tracker: Optional[TokenTracker] = None,
+    ) -> None:
+        try:
+            from langchain_openai import ChatOpenAI
+        except ImportError as exc:
+            raise RuntimeError("Install langchain-openai in the active environment.") from exc
+
+        self.model = os.getenv("AUTO_PROVE_OPENAI_MODEL", model)
+        self.base_url = os.getenv("AUTO_PROVE_OPENAI_BASE_URL")
+        self.api_key = os.getenv("AUTO_PROVE_OPENAI_API_KEY")
+        if not self.base_url or not self.api_key:
+            raise ValueError("AUTO_PROVE_OPENAI_BASE_URL and AUTO_PROVE_OPENAI_API_KEY are required.")
+        chat_model = ChatOpenAI(
+            model=self.model,
+            base_url=self.base_url,
+            api_key=self.api_key,
+            # temperature=_float_env("AUTO_PROVE_LLM_TEMPERATURE", 0.2),
+            # timeout=_float_env("AUTO_PROVE_LLM_TIMEOUT", 60.0),
+            max_completion_tokens=_int_env("AUTO_PROVE_LLM_MAX_TOKENS", 4000),
+        )
+        self.structured_output_method = "json_mode"
+        super().__init__(chat_model, "langchain-openai", token_tracker=token_tracker)
+
+    def fork(self) -> "LLMClient":
+        return OpenAICompatibleClient(model=self.model, token_tracker=self.token_tracker)
+
+
+class AnthropicCompatibleClient(LangChainProofClient):
+    """LangChain adapter for Anthropic-compatible messages endpoints."""
+
+    def __init__(
+        self,
+        model: str = "claude-3-5-sonnet-latest",
+        token_tracker: Optional[TokenTracker] = None,
+    ) -> None:
+        try:
+            from langchain_anthropic import ChatAnthropic
+        except ImportError as exc:
+            raise RuntimeError("Install langchain-anthropic in the active environment.") from exc
+
+        self.model = os.getenv("AUTO_PROVE_ANTHROPIC_MODEL", model)
+        self.base_url = os.getenv("AUTO_PROVE_ANTHROPIC_BASE_URL")
+        self.api_key = os.getenv("AUTO_PROVE_ANTHROPIC_API_KEY")
+        if not self.base_url or not self.api_key:
+            raise ValueError("AUTO_PROVE_ANTHROPIC_BASE_URL and AUTO_PROVE_ANTHROPIC_API_KEY are required.")
+        chat_model = ChatAnthropic(
+            model_name=self.model,
+            base_url=self.base_url,
+            api_key=self.api_key,
+            # temperature=_float_env("AUTO_PROVE_LLM_TEMPERATURE", 0.2),
+            # timeout=_float_env("AUTO_PROVE_LLM_TIMEOUT", 60.0),
+            max_tokens_to_sample=_int_env("AUTO_PROVE_LLM_MAX_TOKENS", 4000),
+        )
+        super().__init__(chat_model, "langchain-anthropic", token_tracker=token_tracker)
+
+    def fork(self) -> "LLMClient":
+        return AnthropicCompatibleClient(model=self.model, token_tracker=self.token_tracker)
+
+
+def client_from_env() -> LLMClient:
+    provider = os.getenv("AUTO_PROVE_LLM_PROVIDER", "heuristic").strip().lower()
+    if provider == "heuristic":
+        return HeuristicLLMClient()
+    if provider == "openai":
+        return OpenAICompatibleClient()
+    if provider == "anthropic":
+        return AnthropicCompatibleClient()
+    raise ValueError("AUTO_PROVE_LLM_PROVIDER must be heuristic, openai, or anthropic.")
+
+
+def _candidates_from_structured(
+    response: ProofCandidatesOut,
+    theorem: str,
+    source: str,
+) -> tuple[List[Candidate], List[str], List[str]]:
+    """Parse structured LLM output into accepted candidates and diagnostics.
+
+    Returns
+    -------
+    candidates:
+        Clean, sorry-free ``Candidate`` objects ready for Lean checking.
+    rejected:
+        Short rejection reasons (for logging / error messages).
+    sorry_hints:
+        Diagnostic strings extracted from *rejected* candidates that contained
+        ``sorry``.  These capture what the LLM tried and where it got stuck,
+        and are forwarded to the split phase as extra context.
+    """
+    candidates = []
+    rejected = []
+    sorry_hints: List[str] = []
+
+    for index, item in enumerate(response.candidates, start=1):
+        normalized = _normalize_candidate_code(item.code, theorem)
+        if _contains_forbidden_lean(normalized):
+            rejected.append(f"candidate {index} contains forbidden Lean token")
+            # Extract a useful diagnostic: what did the LLM try, and where
+            # did it leave a sorry?  We record:
+            #   - The rationale (if any) – often the LLM explains the gap.
+            #   - The first sorry context line (up to 240 chars) so the split
+            #     stage knows which sub-goal was unfinished.
+            hint_parts: List[str] = []
+            if item.rationale:
+                hint_parts.append(f"LLM rationale: {item.rationale[:300]}")
+            sorry_context = _extract_sorry_context(normalized)
+            if sorry_context:
+                hint_parts.append(f"LLM got stuck near:\n{sorry_context}")
+            if hint_parts:
+                sorry_hints.append(
+                    f"[Rejected candidate {index}] " + " | ".join(hint_parts)
+                )
+            continue
+        candidates.append(
+            Candidate(
+                code=normalized,
+                score=item.score,
+                rationale=item.rationale,
+                source=source,
+            )
+        )
+    return candidates, rejected, sorry_hints
+
+
+def _extract_sorry_context(code: str, radius: int = 2) -> str:
+    """Return up to *radius* lines around the first ``sorry`` in *code*."""
+    lines = code.splitlines()
+    for i, line in enumerate(lines):
+        if re.search(r"\bsorry\b", line):
+            start = max(0, i - radius)
+            end = min(len(lines), i + radius + 1)
+            snippet = "\n".join(lines[start:end]).strip()
+            return snippet[:240]
+    return ""
+
+
+def _complete_with(theorem: str, tactic: str) -> str:
+    if ":= by" in theorem:
+        prefix = theorem.split(":= by", 1)[0].rstrip()
+        return prefix + f" := by\n  {tactic}\n"
+    return theorem.rstrip() + f" := by\n  {tactic}\n"
+
+
+def _model_dump_json_or_debug(value: Any) -> str:
+    dump = getattr(value, "model_dump_json", None)
+    if callable(dump):
+        return dump()
+    return json.dumps(value, ensure_ascii=False, default=str)
+
+
+def _structured_debug_text(response: dict[str, Any]) -> str:
+    payload = {
+        "parsed": _model_dump_json_or_debug(response["parsed"]) if response.get("parsed") is not None else None,
+        "parsing_error": str(response.get("parsing_error") or ""),
+        "raw": _raw_message_summary(response.get("raw")),
+    }
+    return json.dumps(payload, ensure_ascii=False, default=str)
+
+
+def _raw_message_summary(message: Any) -> dict[str, Any]:
+    if message is None:
+        return {}
+    payload: dict[str, Any] = {}
+    content = getattr(message, "content", None)
+    if content is not None:
+        payload["content_preview"] = str(content)[:1200]
+    for attribute in ["additional_kwargs", "response_metadata", "tool_calls", "usage_metadata"]:
+        value = getattr(message, attribute, None)
+        if value:
+            payload[attribute] = value
+    return payload
+
+
+def _messages_to_dicts(messages: List[tuple[str, str]]) -> List[dict[str, str]]:
+    return [{"role": role, "content": content} for role, content in messages]
+
+
+def _normalize_candidate_code(code: str, theorem: str) -> str:
+    cleaned = re.sub(r"^\s*import\s+.*$", "", code, flags=re.MULTILINE).strip()
+    if cleaned.startswith(("theorem ", "lemma ", "example ")):
+        return cleaned
+    prefix = theorem.split(":= by", 1)[0].rstrip()
+    if cleaned.startswith(":= by"):
+        return prefix + " " + cleaned
+    if cleaned.startswith(":=by"):
+        return prefix + " := by" + cleaned.removeprefix(":=by")
+    if cleaned.startswith("by"):
+        return prefix + " := " + cleaned
+    if theorem.rstrip().endswith(":= by"):
+        return theorem.rstrip() + "\n  " + cleaned.replace("\n", "\n  ")
+    return cleaned
+
+
+def _contains_forbidden_lean(code: str) -> bool:
+    forbidden = [
+        r"\bsorry\b",
+        r"\badmit\b",
+        r"\baxiom\b",
+        r"\bnative_decide\b",
+        r"\bsorryAx\b",
+    ]
+    return any(re.search(pattern, code) for pattern in forbidden)
+
+
+def _float_env(name: str, default: float) -> float:
+    value = os.getenv(name)
+    return default if value is None or value == "" else float(value)
+
+
+def _int_env(name: str, default: int) -> int:
+    value = os.getenv(name)
+    return default if value is None or value == "" else int(value)

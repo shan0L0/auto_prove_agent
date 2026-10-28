@@ -1,0 +1,12 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(python -m pytest tests/test_llm.py -x -q)",
+      "Bash(python -m pytest tests/ -x -q --ignore=tests/test_lean_integration.py --ignore=tests/test_lean_lsp.py --ignore=tests/test_llm_integration.py)",
+      "Bash(python -m pytest tests/test_sorry_driven.py -x -q)",
+      "Bash(python -c \"from agent.sorry_driven.core import SorryDrivenProver; from agent.llm import FalsifiedSublemma, WitnessValidationOut; print\\('imports OK'\\)\")",
+      "Bash(python -c \"from agent.sorry_driven.core import SorryDrivenProver, _witness_hash; print\\('OK'\\)\")",
+      "Bash(python -c ' *)"
+    ]
+  }
+}

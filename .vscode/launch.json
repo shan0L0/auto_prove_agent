@@ -1,0 +1,71 @@
+{
+    "version": "0.2.0",
+    "configurations": [
+        {
+            "name": "Auto Prove: Solve Dataset 0015",
+            "type": "debugpy",
+            "request": "launch",
+            "module": "agent.main",
+            "cwd": "${workspaceFolder}",
+            "python": "${workspaceFolder}/.venv/bin/python",
+            "console": "integratedTerminal",
+            "envFile": "${workspaceFolder}/.env",
+            "args": [
+                "--task-dir",
+                "dataset/0015",
+                "--output-dir",
+                "output",
+                "--work-root",
+                "runs/workspaces",
+                "--verbose",
+                "--tui",
+                "--review-retries=3"
+            ],
+            "justMyCode": false
+        },
+        {
+            "name": "Auto Prove: Hierarchical Dataset 0001",
+            "type": "debugpy",
+            "request": "launch",
+            "module": "agent.main",
+            "cwd": "${workspaceFolder}",
+            "python": "${workspaceFolder}/.venv/bin/python",
+            "console": "integratedTerminal",
+            "envFile": "${workspaceFolder}/.env",
+            "args": [
+                "--task-dir",
+                "dataset/0001",
+                "--output-dir",
+                "output",
+                "--work-root",
+                "runs/workspaces",
+                "--timeout",
+                "120",
+                "--beam-width",
+                "3",
+                "--max-rounds",
+                "2",
+                "--max-depth",
+                "2",
+                "--verbose"
+            ],
+            "justMyCode": false
+        },
+        {
+            "name": "Auto Prove: Prepare Dataset",
+            "type": "debugpy",
+            "request": "launch",
+            "module": "agent.main",
+            "cwd": "${workspaceFolder}",
+            "python": "${workspaceFolder}/.venv/bin/python",
+            "console": "integratedTerminal",
+            "args": [
+                "--prepare-dataset",
+                "train-00000-of-00001.parquet",
+                "--dataset-dir",
+                "dataset"
+            ],
+            "justMyCode": false
+        }
+    ]
+}

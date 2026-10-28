@@ -1,0 +1,6 @@
+langchain==1.2.15
+langchain-openai==1.2.1
+langchain-anthropic==1.4.1
+langsmith>=0.8.0,<0.9
+pyarrow>=24.0.0
+rich
